@@ -23,8 +23,8 @@ button:disabled{background:#475569;color:#94a3b8;cursor:not-allowed}
   <div class="s"><span>Conteneurs</span><span class="v">94</span></div>
   <div class="s"><span>Palettes</span><span class="v">524</span></div>
   <div class="s"><span>Mouvements</span><span class="v">1 954</span></div>
-  <div class="note">Congés opérateur (6→20 juillet) et période AFTRAL (après le 21 août) volontairement vides.
-  Données existantes conservées.</div>
+  <div class="note">Congés (6→20 juillet) et période AFTRAL (après 21 août) volontairement vides.
+  Allègement automatique de l'historique si la limite Firestore est atteinte, en préservant tous les jours.</div>
 </div>
 <div class="card">
   <div id="pb"><div id="bar"></div></div>
@@ -36,10 +36,35 @@ const D={"w7_pal": [{"id": "PAL-2026-VF98SS", "barcode": "WH-PAL-2026-VF98SS", "
 const CFG={apiKey:"AIzaSyBrVDV5GrGg_Cwkkqd4qwl5qrgJHaR2mHM",authDomain:"opti-flux-sedis-22.firebaseapp.com",
 projectId:"opti-flux-sedis-22",storageBucket:"opti-flux-sedis-22.firebasestorage.app",
 messagingSenderId:"997258420619",appId:"1:997258420619:web:c87833fce38b944909cf8e"};
+const LIMITE=980*1024;   // marge sous 1 Mo
 const L=document.getElementById('log');
 const log=(m,c='inf')=>{L.innerHTML+='<br><span class="'+c+'">['+new Date().toLocaleTimeString()+'] '+m+'</span>';L.scrollTop=1e9;};
 const bar=p=>document.getElementById('bar').style.width=p+'%';
 const sleep=ms=>new Promise(r=>setTimeout(r,ms));
+const poids=o=>new Blob([JSON.stringify(o)]).size;
+
+/* Allège en retirant les éléments les plus ANCIENS d'abord, mais en gardant
+   au moins 1 entrée par jour distinct pour ne jamais vider une journée. */
+function alleger(liste,limite,champ){
+  if(poids(liste)<=limite) return {liste,retires:0};
+  const jour=x=>{const t=x[champ]; const d=typeof t==='number'?new Date(t):new Date(t);
+    return isNaN(d)?'?':d.toISOString().slice(0,10);};
+  // 1 gardien par jour = le plus récent de chaque journée (préserve la couverture)
+  const parJour={};
+  liste.forEach(x=>{const j=jour(x); if(!parJour[j]||(x[champ]>parJour[j][champ]))parJour[j]=x;});
+  const gardiens=new Set(Object.values(parJour).map(x=>x.id));
+  // candidats à retirer = tout sauf gardiens, du plus ancien au plus récent
+  const retirables=liste.filter(x=>!gardiens.has(x.id)).sort((a,b)=>(a[champ]||0)-(b[champ]||0));
+  let out=liste.slice(); let retires=0; let i=0;
+  const idsOut=new Set(out.map(x=>x.id));
+  while(poids(out)>limite && i<retirables.length){
+    idsOut.delete(retirables[i].id); i++; retires++;
+    if(retires%50===0) out=liste.filter(x=>idsOut.has(x.id));
+  }
+  out=liste.filter(x=>idsOut.has(x.id));
+  return {liste:out,retires};
+}
+
 async function go(){
   const b=document.getElementById('b');b.disabled=true;b.textContent='⏳ Injection…';L.innerHTML='';
   try{
@@ -52,18 +77,23 @@ async function go(){
     await sleep(2500);log('Authentifié : '+u.uid.slice(0,10)+'…','ok');bar(15);
     const get=async k=>{try{const s=await db.collection('optiflux_data').doc(k).get();
       return s.exists?JSON.parse(s.data().value):[];}catch(e){log('Lecture '+k+' : '+e.message,'w');return[];}};
-    const cles=['w7_pal','w7_log','w7_anomalies','w7_oplog'];
-    const ex={};for(const k of cles)ex[k]=await get(k);
+    const cfg=[['w7_pal','createdAt'],['w7_log','ts'],['w7_anomalies','ts'],['w7_oplog','ts']];
+    const ex={};for(const [k] of cfg)ex[k]=await get(k);
     log('Existant → palettes '+ex.w7_pal.length+' · mouvements '+ex.w7_log.length,'ok');bar(30);
     const NOW=Date.now();let p=30;
-    for(const k of cles){
+    for(const [k,champ] of cfg){
       const ids=new Set(ex[k].map(x=>x.id));
       const nouveaux=D[k].filter(x=>!ids.has(x.id));
       let fus=[...ex[k],...nouveaux];
-      if(k==='w7_log'||k==='w7_oplog')fus.sort((a,b)=>(a.ts||0)-(b.ts||0));
+      if(champ==='ts'||champ==='createdAt')fus.sort((a,b)=>(a[champ]||0)-(b[champ]||0));
+      const av=poids(fus);
+      if(av>LIMITE){
+        const r=alleger(fus,LIMITE,champ);
+        log('⚠ '+k+' : '+(av/1024|0)+' Ko > limite → allègement de '+r.retires+' entrées anciennes','w');
+        fus=r.liste;
+      }
       await db.collection('optiflux_data').doc(k).set({value:JSON.stringify(fus),updatedAt:NOW});
-      const ko=new Blob([JSON.stringify(fus)]).size/1024|0;
-      log('✅ '+k+' : +'+nouveaux.length+' → '+fus.length+' ('+ko+' Ko)','ok');
+      log('✅ '+k+' : +'+nouveaux.length+' → '+fus.length+' ('+(poids(fus)/1024|0)+' Ko)','ok');
       p+=17;bar(p);
     }
     Object.keys(localStorage).filter(x=>x.startsWith('of_')).forEach(x=>localStorage.removeItem(x));
